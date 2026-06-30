@@ -27,48 +27,63 @@ class TransfersCompute extends Command
         $lineCount = Line::count();
         $this->info("Lines found: {$lineCount}");
 
-        DB::statement('TRUNCATE TABLE line_transfers CASCADE');
+        // ── 1. Calcular forwards via PostGIS ─────────────────────────────
+        $this->info('Computing forward transfers via PostGIS...');
 
-        $lines = Line::query()->whereNotNull('geo_json')->get(['id', 'geo_json']);
+        $forwardRows = DB::select('
+            SELECT
+                a.id          AS line_a_id,
+                b.id          AS line_b_id,
+                ST_X(pa.geom) AS point_a_lng,
+                ST_Y(pa.geom) AS point_a_lat,
+                (pa.path[1] - 1) AS point_a_index,
+                ST_X(pb.geom) AS point_b_lng,
+                ST_Y(pb.geom) AS point_b_lat,
+                (pb.path[1] - 1) AS point_b_index,
+                ROUND(ST_Distance(pa.geom::geography, pb.geom::geography))::int AS walk_distance
+            FROM lines a
+            JOIN lines b
+                ON  a.id < b.id
+                AND ST_DWithin(a.geom::geography, b.geom::geography, :radius)
+            CROSS JOIN LATERAL
+                ST_DumpPoints(ST_GeometryN(a.geom, 1)) AS pa
+            CROSS JOIN LATERAL (
+                SELECT pb_inner.geom, pb_inner.path
+                FROM   ST_DumpPoints(ST_GeometryN(b.geom, 1)) AS pb_inner
+                WHERE  ST_DWithin(pa.geom::geography, pb_inner.geom::geography, :radius)
+                ORDER BY pa.geom <-> pb_inner.geom
+                LIMIT 1
+            ) AS pb
+        ', ['radius' => self::TRANSFER_RADIUS]);
 
-        $lineMap = [];
-        foreach ($lines as $line) {
-            $geoJson = $line->geo_json;
-            $coords = $geoJson['coordinates'][0] ?? null;
-            if ($coords) {
-                $lineMap[$line->id] = $coords;
-            }
-        }
+        $this->info('Raw forward rows from PostGIS: '.count($forwardRows));
 
-        $this->info('Loaded '.count($lineMap).' lines with geometry');
+        // ── 2. Deduplicar forwards en PHP ────────────────────────────────
+        $forwardTransfers = $this->deduplicateNearby(
+            array_map(fn ($r) => (array) $r, $forwardRows)
+        );
+        $this->info('After dedup: '.count($forwardTransfers).' forward transfers');
 
-        $candidatePairs = $this->findCandidatePairs();
-        $this->info('Found '.count($candidatePairs).' candidate line pairs');
+        // ── 3. Generar inversos desde forwards deduplicados ──────────────
+        $inverseTransfers = array_map(fn ($t) => [
+            'line_a_id' => $t['line_b_id'],
+            'line_b_id' => $t['line_a_id'],
+            'point_a_lng' => $t['point_b_lng'],
+            'point_a_lat' => $t['point_b_lat'],
+            'point_a_index' => $t['point_b_index'],
+            'point_b_lng' => $t['point_a_lng'],
+            'point_b_lat' => $t['point_a_lat'],
+            'point_b_index' => $t['point_a_index'],
+            'walk_distance' => $t['walk_distance'],
+            'created_at' => $t['created_at'],
+        ], $forwardTransfers);
 
-        $allTransfers = [];
+        $inverseTransfers = $this->deduplicateNearby($inverseTransfers);
 
-        foreach ($candidatePairs as $i => $pair) {
-            $lineAData = $lineMap[$pair->line_a_id] ?? null;
-            $lineBData = $lineMap[$pair->line_b_id] ?? null;
+        $allTransfers = array_merge($forwardTransfers, $inverseTransfers);
+        $this->info('Total transfers to save: '.count($allTransfers));
 
-            if ($lineAData && $lineBData) {
-                $pairTransfers = $this->computeTransfersForPair(
-                    lineAId: $pair->line_a_id,
-                    lineAPolyline: $lineAData,
-                    lineBId: $pair->line_b_id,
-                    lineBPolyline: $lineBData,
-                );
-                array_push($allTransfers, ...$pairTransfers);
-            }
-
-            if (($i + 1) % 100 === 0 || $i === count($candidatePairs) - 1) {
-                $this->output->write("\rProcessing: ".($i + 1).'/'.count($candidatePairs).' pairs');
-            }
-        }
-
-        $this->newLine();
-        $this->info('Computed '.count($allTransfers).' transfer points');
-
+        // ── 4. Swap atómico ──────────────────────────────────────────────
         $this->saveBatched($allTransfers);
 
         $duration = number_format((microtime(true) - $startTime), 1);
@@ -82,77 +97,9 @@ class TransfersCompute extends Command
         return self::SUCCESS;
     }
 
-    private function findCandidatePairs(): array
-    {
-        return DB::select(
-            'SELECT DISTINCT a.id AS line_a_id, b.id AS line_b_id
-             FROM lines a
-             JOIN lines b ON a.id <> b.id
-             WHERE ST_DWithin(a.geom::geography, b.geom::geography, :radius)
-               AND a.id < b.id',
-            ['radius' => self::TRANSFER_RADIUS],
-        );
-    }
-
-    private function computeTransfersForPair(
-        int $lineAId,
-        array $lineAPolyline,
-        int $lineBId,
-        array $lineBPolyline,
-    ): array {
-        $forwardResults = [];
-
-        foreach ($lineAPolyline as $i => $pA) {
-            $localMin = INF;
-            $localBest = null;
-
-            foreach ($lineBPolyline as $j => $pB) {
-                $dist = self::haversine($pA, $pB);
-
-                if ($dist <= self::TRANSFER_RADIUS && $dist < $localMin) {
-                    $localMin = $dist;
-                    $localBest = ['j' => $j, 'dist' => $dist, 'pB' => $pB];
-                }
-            }
-
-            if ($localBest) {
-                $forwardResults[] = [
-                    'line_a_id' => $lineAId,
-                    'line_b_id' => $lineBId,
-                    'point_a_lng' => $pA[0],
-                    'point_a_lat' => $pA[1],
-                    'point_a_index' => $i,
-                    'point_b_lng' => $localBest['pB'][0],
-                    'point_b_lat' => $localBest['pB'][1],
-                    'point_b_index' => $localBest['j'],
-                    'walk_distance' => (int) round($localBest['dist']),
-                    'created_at' => now(),
-                ];
-            }
-        }
-
-        $dedupedForward = $this->deduplicateNearby($forwardResults);
-
-        $inverseResults = array_map(fn ($t) => [
-            'line_a_id' => $t['line_b_id'],
-            'line_b_id' => $t['line_a_id'],
-            'point_a_lng' => $t['point_b_lng'],
-            'point_a_lat' => $t['point_b_lat'],
-            'point_a_index' => $t['point_b_index'],
-            'point_b_lng' => $t['point_a_lng'],
-            'point_b_lat' => $t['point_a_lat'],
-            'point_b_index' => $t['point_a_index'],
-            'walk_distance' => $t['walk_distance'],
-            'created_at' => now(),
-        ], $dedupedForward);
-
-        $dedupedInverse = $this->deduplicateNearby($inverseResults);
-
-        return array_merge($dedupedForward, $dedupedInverse);
-    }
-
     private function deduplicateNearby(array $transfers): array
     {
+        $now = now();
         $groups = [];
 
         foreach ($transfers as $t) {
@@ -160,56 +107,43 @@ class TransfersCompute extends Command
             $groups[$key][] = $t;
         }
 
+        $cellSize = self::MIN_SEPARATION / 111320.0;
         $result = [];
 
         foreach ($groups as $group) {
+            $occupiedCells = [];
             $dedupedGroup = [];
 
             foreach ($group as $candidate) {
-                $tooClose = false;
+                $cellA = floor($candidate['point_a_lat'] / $cellSize)
+                       .','
+                       .floor($candidate['point_a_lng'] / $cellSize);
+                $cellB = floor($candidate['point_b_lat'] / $cellSize)
+                       .','
+                       .floor($candidate['point_b_lng'] / $cellSize);
+                $cellKey = $cellA.'|'.$cellB;
 
-                foreach ($dedupedGroup as $existing) {
-                    $distA = self::haversine(
-                        [$existing['point_a_lng'], $existing['point_a_lat']],
-                        [$candidate['point_a_lng'], $candidate['point_a_lat']],
-                    );
-                    $distB = self::haversine(
-                        [$existing['point_b_lng'], $existing['point_b_lat']],
-                        [$candidate['point_b_lng'], $candidate['point_b_lat']],
-                    );
-
-                    if ($distA < self::MIN_SEPARATION && $distB < self::MIN_SEPARATION) {
-                        $tooClose = true;
-                        break;
-                    }
+                if (isset($occupiedCells[$cellKey])) {
+                    continue;
                 }
 
-                if (! $tooClose) {
-                    $dedupedGroup[] = $candidate;
-                }
+                $occupiedCells[$cellKey] = true;
+                $candidate['created_at'] = $now;
+                $dedupedGroup[] = $candidate;
             }
 
-            array_push($result, ...$dedupedGroup);
+            foreach ($dedupedGroup as $t) {
+                $result[] = $t;
+            }
         }
 
         return $result;
     }
 
-    private static function haversine(array $p1, array $p2): float
-    {
-        $R = 6371000;
-        $lat1 = deg2rad($p1[1]);
-        $lat2 = deg2rad($p2[1]);
-        $dLat = deg2rad($p2[1] - $p1[1]);
-        $dLng = deg2rad($p2[0] - $p1[0]);
-
-        $a = sin($dLat / 2) ** 2 + cos($lat1) * cos($lat2) * sin($dLng / 2) ** 2;
-
-        return $R * 2 * atan2(sqrt($a), sqrt(1 - $a));
-    }
-
     private function saveBatched(array $transfers): void
     {
+        DB::statement('TRUNCATE TABLE line_transfers CASCADE');
+
         $total = count($transfers);
 
         for ($i = 0; $i < $total; $i += self::BATCH_SIZE) {
@@ -219,5 +153,17 @@ class TransfersCompute extends Command
         }
 
         $this->newLine();
+    }
+
+    private static function haversine(array $p1, array $p2): float
+    {
+        $R = 6371000;
+        $lat1 = deg2rad($p1[1]);
+        $lat2 = deg2rad($p2[1]);
+        $dLat = deg2rad($p2[1] - $p1[1]);
+        $dLng = deg2rad($p2[0] - $p1[0]);
+        $a = sin($dLat / 2) ** 2 + cos($lat1) * cos($lat2) * sin($dLng / 2) ** 2;
+
+        return $R * 2 * atan2(sqrt($a), sqrt(1 - $a));
     }
 }
