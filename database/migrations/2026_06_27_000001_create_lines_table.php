@@ -31,6 +31,8 @@ return new class extends Migration
 
         DB::statement('ALTER TABLE lines ADD COLUMN geom geometry(MultiLineString, 4326)');
         DB::statement('CREATE INDEX idx_lines_geom ON lines USING GIST(geom)');
+        DB::statement('CREATE INDEX IF NOT EXISTS idx_lines_geom_geography ON lines USING GIST (geography(geom))');
+
         DB::statement("ALTER TABLE lines ADD CONSTRAINT lines_sense_check CHECK (sense IN ('OUTBOUND', 'RETURN'))");
         DB::statement('UPDATE lines SET geom = ST_GeomFromGeoJSON(geo_json::text) WHERE geo_json IS NOT NULL');
     }
@@ -38,6 +40,7 @@ return new class extends Migration
     public function down(): void
     {
         DB::statement('DROP INDEX IF EXISTS idx_lines_geom');
+        DB::statement('DROP INDEX IF EXISTS idx_lines_geom_geography');
         Schema::dropIfExists('lines');
     }
 };

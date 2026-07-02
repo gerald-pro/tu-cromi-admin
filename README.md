@@ -43,6 +43,8 @@ composer dev
 | `npm run types:check` | vue-tsc (type check) |
 | `npm run build` | Build producción |
 | `php artisan wayfinder:generate` | Regenerar codegen (`@/routes/`, `@/actions/`) |
+| `php artisan lines:import --force` | Importar líneas desde GeoJSON |
+| `php artisan transfers:compute` | Computar transferencias peatonales (300m, lento ~17min). Usar `--limit=N` para pruebas |
 
 ## Importación de líneas desde GeoJSON
 
@@ -89,7 +91,7 @@ Las migraciones la habilitan automáticamente. La columna `lines.geom` es `geome
 
 ```
 app/
-├── Console/Commands/     # Artisan commands (lines:import, próximamente transfers:compute)
+├── Console/Commands/     # Artisan commands (lines:import, transfers:compute)
 ├── Enums/                # PHP enums (LineSense)
 ├── Models/               # Eloquent models (Line, User, Favorite, Review)
 ├── Http/Controllers/     # Inertia controllers

@@ -20,6 +20,9 @@ return new class extends Migration
             $table->integer('point_b_index');
             $table->float('walk_distance');
             $table->timestamp('created_at')->useCurrent();
+
+            $table->index(['line_a_id', 'line_b_id'], 'idx_line_transfers_line_a_line_b');
+            $table->index(['line_b_id', 'line_a_id'], 'idx_line_transfers_line_b_line_a');
         });
     }
 

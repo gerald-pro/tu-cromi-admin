@@ -6,7 +6,27 @@ use App\Enums\LineSense;
 use App\Models\Line;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 
+/**
+ * Import transport lines from a GeoJSON file.
+ *
+ * Source data: Santa Cruz, Bolivia (database/data/rutas_scz.geojson).
+ *
+ * Conventions:
+ * - Each feature's "sentido" property maps to LineSense:
+ *   1 = OUTBOUND (ida, away from city center)
+ *   any other value = RETURN (vuelta, back to city center)
+ * - RETURN lines have their coordinates reversed (both segments and
+ *   coordinate pairs within each segment) so the stored geometry
+ *   always travels in a consistent outbound-to-return direction.
+ * - After import, lines sharing the same "code" are linked via
+ *   parent_line_id: the OUTBOUND record points to its RETURN counterpart
+ *   and vice versa. Lines without a counterpart (e.g. circular routes
+ *   72, 73) are left unlinked.
+ * - Finally, the PostGIS geometry column is populated via
+ *   ST_GeomFromGeoJSON(geo_json::text).
+ */
 class LinesImport extends Command
 {
     protected $signature = 'lines:import
@@ -126,10 +146,10 @@ class LinesImport extends Command
 
     private function populateGeometry(): void
     {
-        $affected = DB::statement(
+        $affected = DB::update(
             'UPDATE lines SET geom = ST_GeomFromGeoJSON(geo_json::text) WHERE geo_json IS NOT NULL AND geom IS NULL'
         );
 
-        $this->info("Geometry column populated for {$affected} lines.");
+        $this->info("Geometry column populated for {$affected} ".Str::plural('line', $affected).'.');
     }
 }

@@ -1,6 +1,6 @@
 # tu-cromi-admin
 
-Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue new-york-v4).
+Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue new-york-v4, PostGIS).
 
 ## Commands
 
@@ -20,6 +20,23 @@ Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue 
 | Build | `npm run build` | |
 | Codegen | `php artisan wayfinder:generate` | Regenerates `resources/js/{actions,routes,wayfinder}/` |
 
+## Domain model — Lines
+
+- **Each `lines` row = one direction** (OUTBOUND or RETURN), not a full line. Real-world lines (e.g. "Línea 1") generate two records sharing the same `code`.
+- `code` has an index but **no unique constraint** — two rows share it.
+- Opposite directions link bidirectionally via `parent_line_id` (self-referential FK). Lines with only one sense (circular) have no counterpart.
+- Coordinates: `geo_json` (JSONB) stores raw MultiLineString `[lng, lat]`. `geom` (PostGIS `geometry(MultiLineString,4326)`) is populated from geo_json via `ST_GeomFromGeoJSON`. GIST index on geography.
+- `LineSense` enum: `Outbound = 'OUTBOUND'` (ida), `Return = 'RETURN'` (vuelta).
+
+## Artisan commands
+
+| Command | Purpose |
+|---|---|
+| `lines:import` | Import from GeoJSON (Santa Cruz data). `sentido=1` → OUTBOUND, other → RETURN. RETURN coordinates reversed. Links opposite lines by `code`. `--force` to truncate first, `--path=` for custom file. |
+| `transfers:compute` | Precompute pedestrian transfers. Uses PostGIS (ST_DWithin 300m, KNN lateral join). Deduplicates via 100m spatial grid. **Can be slow (17min).** Use `--limit=N` to test with N lines first. |
+
+Both commands have class-level docblocks with algorithm details.
+
 ## Architecture
 
 - **Frontend entry**: `resources/js/app.ts` — layout dispatching, theme init, flash toasts.
@@ -27,10 +44,17 @@ Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue 
 - **Layouts**: Assigned by page name in `app.ts`: `auth/*` → AuthLayout, `settings/*` → AppLayout+SettingsLayout, `Welcome` → none, else → AppLayout.
 - **Routes**: `routes/web.php`, `routes/settings.php`, `routes/console.php`. Use named routes.
 - **`@` alias**: `resources/js/` (tsconfig + Inertia config).
-- **DB**: PostgreSQL (dev/prod), SQLite `:memory:` (tests).
+- **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests).
 - **SSR**: Enabled. Dev URL at `127.0.0.1:13714` (config/inertia.php).
-- **Auth**: Laravel Fortify — features: registration, password reset, email verification, 2FA, passkeys. Config at `config/fortify.php`.
+- **Auth**: Laravel Fortify — features: registration, password reset, email verification, 2FA, passkeys.
 - **Gated pages**: `dashboard` requires `auth` + `verified` middleware.
+- **No service layer**: Domain logic lives in Models and Commands.
+- **Incomplete**: `IssueReport` migration exists but no Model or UI yet.
+
+## Testing quirks
+
+- **PHPUnit classes** (not Pest). `RefreshDatabase` trait. `skipUnlessFortifyHas()` for conditional Fortify feature tests.
+- Tests use **SQLite `:memory:`** — PostGIS spatial queries (`ST_DWithin`, `ST_Distance`) will **fail** in tests. Commands using PostGIS cannot be tested via the standard test suite.
 
 ## Conventions
 
@@ -40,7 +64,10 @@ Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue 
 - **shadcn-vue**: `cn()` from `@/lib/utils` (clsx + tailwind-merge), lucide icons.
 - **Wayfinder**: Import controllers from `@/actions/`, named routes from `@/routes/`. Generated files are gitignored.
 - **Cookies excluded from encryption**: `appearance`, `sidebar_state` (see `bootstrap/app.php`).
-- **Tests**: PHPUnit classes (not Pest). `RefreshDatabase` trait. Use `skipUnlessFortifyHas()` for conditional Fortify feature tests.
 - **Passkeys**: `PASSKEYS_USER_HANDLE_SECRET` env var (falls back to `APP_KEY`).
 - **App boots** `initializeTheme()` + `initializeFlashToast()` on every page load (see `app.ts`).
 - **Migrations**: `$table->timestamps()` for `created_at`/`updated_at` pairs; `$table->softDeletes()` for soft deletes; `string()` defaults to 255; `foreignId('foo_id')->constrained()` resolves table by convention.
+
+## MCP
+
+`opencode.json` enables `laravel-boost` (Laravel Boost MCP server). Use it for DB schema, error logs, and docs searches.
